@@ -1,0 +1,42 @@
+# data folder
+# data/
+# data/**/*
+# !data/config
+# !data/config/*
+
+# saved models folder
+models/
+models/**/*
+
+# jupyter
+.ipynb_checkpoints
+.ipynb_checkpoints/**
+**/.ipynb_checkpoints
+**/.ipynb_checkpoints/**
+
+# notebooks
+notebooks
+notebooks/*
+
+# job launching scripts
+launch_*.py
+
+# data config files
+# data/config/*
+# !data/config/example.json
+
+# python cache
+__pycache__
+__pycache__/**
+**/__pycache__
+**/__pycache__/**
+
+# wandb
+wandb
+wandb/**
+**/wandb
+**/wandb/**
+
+# experiment runs
+runs
+runs/**

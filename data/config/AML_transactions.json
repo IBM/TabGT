@@ -1,0 +1,25 @@
+{
+    "edge_table": {
+        "source_id_column": "From ID",
+        "destination_id_column": "To ID",
+        "categorical_columns": [
+            "Payment Currency", "Receiving Currency", "Payment Format"
+        ],
+        "continuous_columns": [
+            "Timestamp", "Amount Paid", "Amount Received"
+        ],
+        "normalization": {
+            "Timestamp": "standard",
+            "Amount Paid": "log-standard",
+            "Amount Received": "log-standard"
+        }
+    },
+    "node_table": {
+        "id_column": null,
+        "categorical_columns": [
+        ],
+        "continuous_columns": [
+        ],
+        "normalization": {}
+    }
+}

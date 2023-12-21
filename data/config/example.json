@@ -1,0 +1,27 @@
+{
+    "edge_table": {
+        "source_id_column": "From ID",
+        "destination_id_column": "To ID",
+        "categorical_columns": [
+            "Edge Feature 1", "Edge Feature 2"
+        ],
+        "continuous_columns": [
+            "Edge Feature 3"
+        ],
+        "normalization": {
+            "Edge Feature 3": "log-standard"
+        }
+    },
+    "node_table": {
+        "id_column": "Node ID",
+        "categorical_columns": [
+            "Node Feature 1", "Node Feature 2"
+        ],
+        "continuous_columns": [
+            "Node Feature 3"
+        ],
+        "normalization": {
+            "Node Feature 3": "standard"
+        }
+    }
+}
