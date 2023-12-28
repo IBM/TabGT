@@ -3,20 +3,22 @@ import random
 
 import torch
 import numpy as np
-import pandas as pd
-from IPython.display import display, HTML
 
 
-# Set seed
-def set_seed(seed):
+def set_seed(seed: int):
+    """Set Python, NumPy, and Pytorch PRNG seed for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def choice(N: int, k: int = 1, p=None):
-    """Sample `k` elements from 0 to `N-1` without replacement."""
+def choice(N: int, k: int = 1, p=None) -> list[int]:
+    """Sample `k` integers from 0 to `N-1` without replacement.
+    
+    This method is more memory and time efficient than ``np.random.choice`` in
+    some scenarios.
+    """
     X = [np.random.choice(N, size=1, replace=True, p=p)[0]]
     X = set(X)
     while len(X) != k:

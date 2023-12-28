@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import logging
 import argparse
 
-### ARGUMENTS ###
+# ARGUMENTS #
 parser = argparse.ArgumentParser(description="Pretrain TURL+GNN on target dataset")
 
 # General
@@ -54,7 +53,10 @@ parser.add_argument("--mask_node_feats_in_eval", action="store_true", help="Whet
 args = parser.parse_args()
 MASK_GNN_EDGES = not args.disable_mask_gnn_edges
 
-# Main imports
+# MAIN IMPORTS #
+import gc
+import logging
+
 import torch
 import wandb
 from munch import munchify
@@ -69,6 +71,7 @@ from src.utils import set_seed
 from src.data import KGDataset, edge_wise_random_split, transaction_split
 from src.parsers import HybridLMGNNParser
 
+# INIT #
 # Use GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -81,10 +84,10 @@ logging.info(f'Starting with arguments: {args}')
 # Set seed
 set_seed(seed=args.seed)
 
+# DECLARE DATASET #
 dataset = KGDataset(edge_data_path=args.edge_data_path, node_data_path=args.node_data_path, config_path=args.data_config_path)
 
-# Use random_split to create training and validation datasets
-# train_dataset, eval_dataset = node_wise_random_split(dataset)
+# SPLIT DATASET #
 if args.split == 'edge-wise':
     train_dataset, eval_dataset = edge_wise_random_split(dataset, shuffle=True, seed=args.seed)
 elif args.split == 'transaction':
@@ -100,6 +103,7 @@ train_dataset.normalize()
 eval_dataset.normalize(scalers=train_dataset.scalers)
 logger.info('Normalized training and validation.')
 
+# INIT CONFIGURATION #
 # Load the default BERT tokenizer
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
@@ -108,10 +112,11 @@ parser = HybridLMGNNParser(dataset, tokenizer=tokenizer)
 turl_config = TURLConfig(tok_vocab_size=len(tokenizer), ent_vocab_size=len(parser.lm_parser.entity_vocab), mask_node_feats_in_eval=args.mask_node_feats_in_eval, max_entity_candidate=args.candidates, output_attentions=False)
 parser.lm_parser.lm_config = turl_config
 
-gnn_config = GNNConfig(n_hidden=128, n_gnn_layers=2, w_ce1=1.0, w_ce2=1.0, dropout=0.1, final_dropout=0.05, n_heads=4, config_json_file=None, n_node_feats=parser.gnn_parser.n_node_feats, n_edge_feats=parser.gnn_parser.n_edge_feats, n_classes=1, deg=2, max_nb_input_edges=1e12)
+gnn_config = GNNConfig(n_hidden=128, n_gnn_layers=2, final_dropout=0.05, n_node_feats=parser.gnn_parser.n_node_feats, n_edge_feats=parser.gnn_parser.n_edge_feats, n_classes=1, deg=2)
 
 config = TURLGNNConfig(arch_type=args.arch_type, gnn_arch="gine", include_gnn_node_feats=args.include_gnn_node_feats, lp_loss_w=args.lp_loss_w, fused_arch_layers=args.fused_arch_layers, alternate_objective=args.alternate_objective, no_node_vocab=args.no_node_vocab)
 
+# DECLARE MODEL #
 if config.arch_type == "fused":
     model = FusedTURLGNN(config, turl_config, gnn_config)
 else:
@@ -130,30 +135,31 @@ if args.load_from:
 model.to(device)
 
 # ARGUMENTS AND CONFIG #
-
 train_args = munchify({
     "shuffle_train": True,
     "device": "cuda",
     "save_total_limit": 1,
     "save_epochs": 0 if args.no_save else 1,
+    # Where model checkpoints will be saved
     "output_dir": f"./runs/TURL_GNN/{args.unique_n}/{args.run_name}",
     "per_gpu_train_batch_size": args.batch_size, 
     "per_gpu_eval_batch_size": args.batch_size, 
     "disable_khop": args.disable_khop,
     "learning_rate": args.lr,
-    "cache_dir": "cache",
-    # maximum no. of candidate entities to give the model to choose
+    "warmup_steps": 0,
+    "adam_epsilon": 1e-8,
+    "max_grad_norm": 1.0, 
+    # Maximum no. of candidate entities to give the model to choose
     # from. Has to be at least as big as the no. of unique entities
     # in the table (!)
     "max_entity_candidate": turl_config.max_entity_candidate,
+    # Header token MLM probability
     "mlm_probability": 0.2,
-    "adam_epsilon": 1e-8,
-    "warmup_steps": 0,
-    "max_grad_norm": 1.0, 
     "logging_steps": 2_000,
     # Also sends batch info to wandb
     "log_lr_every": args.log_every,
     "eval_log_metrics_every": 500,
+    # How to weight header MLM vs entity cell filling in TURL
     # loss = tok_loss * l + ent_loss * (1 - l)
     "loss_lambda": 0.5,
 
@@ -162,13 +168,13 @@ train_args = munchify({
 })
 train_args.update(args.__dict__)
 
-# Training
-
+# TRAIN #
 # Empty CUDA and CPU cache
 torch.cuda.empty_cache()
-import gc; print(f'Collected {gc.collect()} bytes.')
+print(f'Collected {gc.collect()} bytes.')
 
 # Weights & Biases
-if args.wandb: wandb.login()
+if args.wandb: 
+    wandb.login()
 
-global_step, tr_loss = train(train_args, config, turl_config, gnn_config, train_dataset, model, parser=parser, eval_dataset=eval_dataset, log_wandb=args.wandb, debug=False)
+global_step, tr_loss = train(train_args, config, turl_config, gnn_config, train_dataset, model, parser=parser, eval_dataset=eval_dataset, log_wandb=args.wandb)

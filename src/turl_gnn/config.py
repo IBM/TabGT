@@ -10,40 +10,69 @@ logger = logging.getLogger(__name__)
 
 
 class TURLGNNConfig(PretrainedConfig):
-    r"""
-    Arguments
-    ---------
-    arch_type : str
-        The type of TabTran+GNN arch::
+    """Configuration for TURL + GNN hybrid architecture.
 
-        * `parallel`: the two archs are separable
-        * `sequential`: TabTran -> GNN
-    node_feat_type : str
-        Type of node features for non-seed nodes. Can be::
+    Parameters
+    ----------
+    arch_type : str, optional
+        The type of hybrid architecture:
 
-        * `vocab`: features come from the TURL entity vocabulary
-    fused_arch_layers : list[str]
-        How to distribute the fused layers. `lm` means transformer layer,
-        `gnn` means GNN layer. Layers can be combined:: 
+        - **parallel**: The two archs are separable.
+        - **fused**: Node embeddings are combined at the end of each layer.
+
+    gnn_arch : str, optional
+        The type of GNN architecture to use. Currently, only "gine" is 
+        supported.
+    node_feat_type : str, optional
+        Type of node features. Can be:
+
+        - **vocab**: Node features come from the TURL entity vocabulary.
+        - **gnn**: Node features are the default GNN input node features.
+    
+    include_gnn_node_feats : bool, optional
+        Whether to include node features to the GNN input by mixing them 
+        through a MLP.
+    mlp_dropout : float, optional
+        Internal dropout on all MLP modules. This includes the input MLP module
+        that mixes GNN input node features with node embeddings from the TURL 
+        entity vocabulary, and the mixing module in the **fused** architecture.
+    lp_loss_w : float, optional
+        The link prediction loss coefficient. Use this parameter to scale the
+        loss impact during training for link prediction differently than for
+        cell filling.
+    fused_arch_layers : list[str], optional
+        How to distribute the fused layers. ``lm`` means transformer layer,
+        while ``gnn`` means GNN layer. Layers can be combined with ``|``:
         
-        * `lm|gnn` means both layers in parallel. We can also have multiple like `lm|lm|gnn`.
+        - ``lm|gnn`` means both layers in parallel.
+        - ``lm|lm|gnn`` means two transformer layers and one GNN layer in 
+            parallel.
 
-        The GNN aggregation is GINe.
-    alternate_objective : list[str]
-        How to alternate the objective during training::
+        Each layer can be specified in this format as a list. For example,
+        ``["lm", "lm", "lm|gnn", "lm|gnn"]`` defines four layers where the
+        first two are single transformer layers and the last two are
+        parallel transformer and GNN layers.
 
-        * If `cf`, then cell filling is done in that step
-        * If `lp`, then link prediction is done in that step
-        * If `cf+lp`, then both cell filling and link prediction are done in that step
+        The GNN aggregation is GINe and the tabular transformer is TURL.
+    alternate_objective : list[str], optional
+        How to alternate the objective during training:
 
-        For example, `["cf", "lp", "lp", "cf+lp"]` would do CF, the next two steps LP, and then
-        both CF and LP. This alternation repeats througout training.
-    no_node_vocab : bool
+        - If ``cf``, then cell filling (CF) is backprop'd in that step.
+        - If ``lp``, then link prediction (LP) is backprop'd in that step.
+        - If ``cf+lp``, then both CF and LP are backprop'd in that step.
+
+        For example, ``["cf", "lp", "lp", "cf+lp"]`` would do CF, the next two 
+        steps LP, and then both CF and LP. This alternation repeats througout 
+        training.
+    no_node_vocab : bool, optional
         Whether to not use learned vocab embeddings as input node embeds.
-        If set to `True`, you should also set `include_gnn_node_feats` to `True` so
-        as to have input node features.
+        If set to `True`, you should also set `include_gnn_node_feats` to `True` 
+        so as to have input node features.
+    config_json_file : str, optional
+        Optional file path with configuration file in JSON format. If
+        not ``None``, all other arguments are ignored.
     """
-    def __init__(self, arch_type="parallel", gnn_arch="gine", node_feat_type="vocab", include_gnn_node_feats=True, mlp_dropout=0.0, lp_loss_w=1.0, fused_arch_layers=["lm", "lm", "lm|gnn", "lm|gnn"], alternate_objective=["cf+lp"], no_node_vocab=False, config_json_file=None, **kwargs):
+    def __init__(self, *, arch_type="parallel", gnn_arch="gine", node_feat_type="vocab", include_gnn_node_feats=True, mlp_dropout=0.0, lp_loss_w=1.0, fused_arch_layers=["lm", "lm", "lm|gnn", "lm|gnn"], alternate_objective=["cf+lp"], no_node_vocab=False, config_json_file=None, **kwargs):
         super(TURLGNNConfig, self).__init__(**kwargs)
 
         if isinstance(config_json_file, str) or (sys.version_info[0] == 2

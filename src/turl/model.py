@@ -1,3 +1,14 @@
+"""TURL model and layer class definition.
+
+.. note::
+
+    Code is adapted and modified from `TURL's official GitHub <https://github.com/sunlab-osu/TURL/blob/release_ongoing/model/model.py>`_.
+
+.. seealso::
+
+    Deng, Xiang, et al. "Turl: Table understanding through representation learning." *ACM SIGMOD Record* 51.1 (2022): 33-40.
+
+"""
 # Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -190,10 +201,6 @@ class TableModel(BertPreTrainedModel):
 
         self.init_weights()
 
-    def load_pretrained(self, checkpoint, is_bert=True):
-        self.embeddings.load_pretrained(checkpoint, is_bert=is_bert)
-        self.encoder.load_pretrained(checkpoint, is_bert=is_bert)
-
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
 
@@ -314,10 +321,6 @@ class TURL(BertPreTrainedModel):
         if tok_output_embeddings is not None:
             self._tie_or_clone_weights(tok_output_embeddings, tok_input_embeddings)
 
-    def load_pretrained(self, checkpoint):
-        self.table.load_pretrained(checkpoint)
-        self.cls.load_pretrained(checkpoint)
-
     def forward(self, input_tok, input_tok_type, input_tok_pos, input_tok_mask,
                 input_ent, input_ent_type, input_ent_pos, input_ent_mask, ent_candidates,
                 tok_masked_lm_labels, ent_masked_lm_labels, exclusive_ent_mask=None, 
@@ -348,8 +351,6 @@ class TURL(BertPreTrainedModel):
             if exclusive_ent_mask is not None:
                 # add to ent_prediction_scores -10_000 if the predicted entity is in the same column
                 # so that it cannot predict that entity as being the one in the cell
-                # (why would you want to do that ??)
-                # vec[i][j][index[i][j][k]] += src[i][j][k]
                 # for the entities which are supposed to be ignored, set the index to 0 so that
                 # it doesn't go out of range
                 index = exclusive_ent_mask.clone()

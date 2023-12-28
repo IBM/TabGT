@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch_geometric as pyg
 from tqdm import tqdm
+from munch import Munch
 
 from .data import KGDataset
 from .utils import choice
@@ -18,35 +19,77 @@ logger = logging.getLogger(__name__)
 
 
 class Parser:
-    """Abstract class for data parsers."""
-    def __init__(self, dataset: KGDataset, cache_dir: str = None) -> None:
+    """Abstract class for data parsers.
+    
+    Parameters
+    ----------
+    dataset : KGDataset
+        Dataset that will be parsed. 
+    """
+    def __init__(self, dataset: KGDataset) -> None:
         self.dataset = dataset
-        if cache_dir is None:
-            cache_dir = os.path.join(os.path.dirname(dataset.edge_data_path), '.cache')
-        self.cache_dir = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
         self.preprocess(dataset)
 
     # This method may be overwritten by child classes
     # @abstractmethod
     def preprocess(self, dataset: KGDataset):
+        """Prepare parser.
+        
+        This function is called once at initialization.
+        """
         pass
 
     # This method must be overwritten by child classes
     # @abstractmethod
     def parse_df(self, edge_df: pd.DataFrame, node_df: pd.DataFrame):
-        # the indicies in `node_df` correspond to the `SRC` and `DST` columns in `edge_df`
+        """Prepare edge and node data as input to the model."""
         raise NotImplementedError()
 
     # This method must be overwritten by child classes
     # @abstractmethod
-    def collate_fn(self, dataset, samples, args, train):
+    def collate_fn(self, dataset: KGDataset, samples: list[int], args: Munch, train: bool):
+        """Build batch for model training or validation.
+        
+        This method is called by :class:`~torch.utils.data.DataLoader` during
+        training and validation to generate the input batches.
+
+        For example, the simplest content for this method could be as follows::
+
+            edge_df, node_df = dataset.sample_neighs(samples)
+            input = self.parse_df(edge_df, node_df)
+            return input
+
+        Parameters
+        ----------
+        dataset : KGDataset
+            Train or validation dataset.
+        samples : list[int]
+            List of edge indicies to pass to :class:`~KGDataset.sample_neighs`.
+        args : Munch
+            Train and validation arguments from ``train.py``.
+        train : bool
+            Whether we are training or validating.
+        """
         raise NotImplementedError()
 
 
 class LMParser(Parser):
-    """Data parser for language models."""
+    """Data parser for TURL.
+
+    .. note::
+
+        Some of this code is adapted from `TURL's official repository <https://github.com/sunlab-osu/TURL/blob/bfec92e942a648695b3910aab42a6f0b679d37fc/data_loader/data_loaders.py>`_.
+    
+    Parameters
+    ----------
+    include_node_feats : bool, optional
+        Whether to append source and destination node features as extra columns
+        in :class:`~LMParser.parse_df`.
+    tokenizer : transformers tokenizer
+        Tokenizer to use to parse table headers.
+    """
     RESERVED_ENT_VOCAB = {0:{'id':'[PAD]', 'count': -1}, 1:{'id':'[ENT_MASK]', 'count': -1}, 2:{'id':'[PG_ENT_MASK]', 'count': -1}, 3:{'id':'[CORE_ENT_MASK]', 'count': -1}}
+
     def __init__(self, *args, include_node_feats=True, tokenizer=None, **kwargs) -> None:
         self.include_node_feats = include_node_feats
         self.tokenizer = tokenizer
@@ -65,81 +108,6 @@ class LMParser(Parser):
         self.sample_distribution = self._generate_vocab_distribution(entity_vocab)
 
         self._preprocess_col_to_candidates(dataset)
-
-    def _preprocess_col_to_candidates(self, dataset: KGDataset):
-        edge_cols = [dataset.config.edge_src_col, dataset.config.edge_dst_col] + dataset.config.edge_cat_cols
-        node_cols = dataset.config.node_cat_cols
-        self.col_to_candidates = [np.array([self.ent2idx['[PAD]']])] * (len(edge_cols) + 2*len(node_cols)) 
-
-        logger.info('Computing per-column candidates ..')
-
-        # Include edge feature columns
-        for col_i, col in tqdm(enumerate(edge_cols), total=len(edge_cols), desc='Edge columns'):
-            col_data = dataset.edge_data[col].map(lambda x: self.ent2idx.get(x, float('nan')))
-            # Fill NaN with [PAD]
-            col_data.fillna(self.ent2idx['[PAD]'], inplace=True)
-            self.col_to_candidates[col_i] = col_data.unique()
-        # Include node feature columns. These columns are concat at the end for SRC and DST nodes
-        for i in (0, 1):
-            for col_i, col in tqdm(enumerate(node_cols), total=len(node_cols), desc=f'Node {i} columns'):
-                col_data = dataset.node_data[col].map(lambda x: self.ent2idx.get(x, float('nan')))
-                # Fill NaN with [PAD]
-                col_data.fillna(self.ent2idx['[PAD]'], inplace=True)
-                self.col_to_candidates[len(edge_cols) + i*len(node_cols) + col_i] = col_data.unique()
-        self.col_to_candidates = np.array(self.col_to_candidates, dtype=object)
-
-    def _generate_vocab_distribution(self, entity_vocab):
-        """Returns array with the log10 of the frequency of the entity in the dataset."""
-        distribution = np.zeros(len(entity_vocab))
-        for i, v in entity_vocab.items():
-            if i in self.RESERVED_ENT_VOCAB:
-                distribution[i] = 2
-            else:
-                distribution[i] = int(v['count'])
-        distribution = np.log10(distribution)
-        distribution /= np.sum(distribution)
-        return distribution
-        
-    def _preprocess_entity_vocab(self, dataset: KGDataset):
-        entity_vocab = copy.deepcopy(self.RESERVED_ENT_VOCAB)
-
-        logger.info('Preprocessing entity vocabulary..')
-
-        src_ids = dataset.edge_data[dataset.config.edge_src_col].value_counts()
-        dst_ids = dataset.edge_data[dataset.config.edge_dst_col].value_counts()
-        id_counts = src_ids.add(dst_ids, fill_value=0)
-
-        def _insert_idx_counts(index, counts, prefix='', id_to_ent_id=None):
-            for id, count in tqdm(zip(index, counts), total=len(counts)):
-                id = prefix + str(id)
-                ent_id = len(entity_vocab)
-                entity_vocab[ent_id] = { 'id': id, 'count': count }
-                if id_to_ent_id is not None:
-                    id_to_ent_id[id] = ent_id
-
-        # mapping between holding and asset IDs and their respective entity ID
-        id_to_ent_id = dict()
-
-        _insert_idx_counts(id_counts.index, id_counts, id_to_ent_id=id_to_ent_id)
-
-        # extract other categorical data
-        cat_counts = None
-        for cat_col in dataset.config.edge_cat_cols:
-            counts = dataset.edge_data[cat_col].value_counts()
-            cat_counts = counts if cat_counts is None else cat_counts.add(counts, fill_value=0)
-        for cat_col in dataset.config.node_cat_cols:
-            counts = dataset.node_data[cat_col].value_counts()
-            cat_counts = counts if cat_counts is None else cat_counts.add(counts, fill_value=0)
-        
-        _insert_idx_counts(cat_counts.index, cat_counts)
-
-        id_ent_id_set = torch.tensor(list(set(id_to_ent_id.values()))).cpu()
-        non_ent_ids = set(entity_vocab.keys()) - set(id_to_ent_id.values())
-        non_id_ent_id_set = torch.tensor(list(non_ent_ids)).cpu()
-            
-        logger.info('total number of entities: %d' % (len(entity_vocab)))
-        logger.info(f'# of All IDs in dataset: {len(id_ent_id_set)}')
-        return entity_vocab, id_ent_id_set, non_id_ent_id_set
 
     def parse_df(self, edge_df: pd.DataFrame, node_df: pd.DataFrame, train: bool, args):
         # Include node features as extra columns to the right
@@ -261,41 +229,6 @@ class LMParser(Parser):
         return [np.array(input_tok),np.array(input_tok_type),np.array(input_tok_pos),input_tok_mask, \
                 np.array(input_ent),np.array(input_ent_type),input_ent_pos,input_ent_mask, \
                 core_entity_mask,entities_unique,entity_cand]
-
-    def _collate_fn(self, dataset: KGDataset, samples, df, batch, args, train):
-        edge_ids = dataset.edge_data.index[samples]
-
-        batch = [v[None, ...] if isinstance(v, np.ndarray) else [v] for v in batch]
-        input_tok,input_tok_type,input_tok_pos,input_tok_mask,input_ent,input_ent_type,input_ent_pos,input_ent_mask,core_entity_mask,entities_unique,entity_cand = batch
-
-        input_tok = torch.LongTensor(input_tok)
-        input_tok_type = torch.LongTensor(input_tok_type)
-        input_tok_pos = torch.LongTensor(input_tok_pos)
-        input_tok_mask = torch.LongTensor(input_tok_mask)
-
-        input_ent = torch.LongTensor(input_ent)
-        input_ent_type = torch.LongTensor(input_ent_type)
-        input_ent_pos = torch.LongTensor(input_ent_pos)
-        input_ent_mask = torch.LongTensor(input_ent_mask)
-        core_entity_mask = torch.BoolTensor(core_entity_mask)
-        
-        input_tok_final, input_tok_labels = self.mask_tokens(input_tok, self.tokenizer, mlm_probability=args.mlm_probability)
-        input_ent_final, input_ent_labels = self.mask_ent(self.lm_config, train, df, edge_ids, input_ent, input_ent_pos, 
-                                                                 core_entity_mask, 
-                                                                 mlm_probability=args.ent_mlm_probability,
-                                                                 id_ent_id_set=self.id_ent_id_set,
-                                                                 ent_mask_prob=args.ent_mask_prob, rand_word_prob=args.rand_word_prob,
-                                                                 khop=dataset.num_neighbors is not None)
-        
-        ent_candidates = self.generate_random_candidate(args, input_ent, entities_unique, self.sample_distribution, batch_ent_cand=entity_cand)
-        ent_candidates = torch.LongTensor(ent_candidates)
-
-        # fix position embeddings
-        input_tok_pos[:, :] = torch.arange(input_tok_pos.shape[1])
-
-        return {'input_tok': input_tok_final, 'input_tok_type': input_tok_type, 'input_tok_pos': input_tok_pos, 'tok_masked_lm_labels': input_tok_labels, 
-                'input_tok_mask': input_tok_mask, 'input_ent': input_ent_final, 'input_ent_type': input_ent_type, 'input_ent_pos': input_ent_pos, 
-                'ent_masked_lm_labels': input_ent_labels, 'input_ent_mask': input_ent_mask, 'ent_candidates': ent_candidates }
 
     def mask_tokens(self, inputs, tokenizer, mlm_probability=0.2):
         """Prepare masked tokens inputs/labels for MLM on the header: 80% MASK, 10% random, 10% original. """
@@ -434,6 +367,116 @@ class LMParser(Parser):
         N = len(self.dataset.config.node_cat_cols)
         return torch.arange(2+E, 2+E+2*N)
 
+    def _preprocess_col_to_candidates(self, dataset: KGDataset):
+        edge_cols = [dataset.config.edge_src_col, dataset.config.edge_dst_col] + dataset.config.edge_cat_cols
+        node_cols = dataset.config.node_cat_cols
+        self.col_to_candidates = [np.array([self.ent2idx['[PAD]']])] * (len(edge_cols) + 2*len(node_cols)) 
+
+        logger.info('Computing per-column candidates ..')
+
+        # Include edge feature columns
+        for col_i, col in tqdm(enumerate(edge_cols), total=len(edge_cols), desc='Edge columns'):
+            col_data = dataset.edge_data[col].map(lambda x: self.ent2idx.get(x, float('nan')))
+            # Fill NaN with [PAD]
+            col_data.fillna(self.ent2idx['[PAD]'], inplace=True)
+            self.col_to_candidates[col_i] = col_data.unique()
+        # Include node feature columns. These columns are concat at the end for SRC and DST nodes
+        for i in (0, 1):
+            for col_i, col in tqdm(enumerate(node_cols), total=len(node_cols), desc=f'Node {i} columns'):
+                col_data = dataset.node_data[col].map(lambda x: self.ent2idx.get(x, float('nan')))
+                # Fill NaN with [PAD]
+                col_data.fillna(self.ent2idx['[PAD]'], inplace=True)
+                self.col_to_candidates[len(edge_cols) + i*len(node_cols) + col_i] = col_data.unique()
+        self.col_to_candidates = np.array(self.col_to_candidates, dtype=object)
+
+    def _generate_vocab_distribution(self, entity_vocab):
+        """Returns array with the log10 of the frequency of the entity in the dataset."""
+        distribution = np.zeros(len(entity_vocab))
+        for i, v in entity_vocab.items():
+            if i in self.RESERVED_ENT_VOCAB:
+                distribution[i] = 2
+            else:
+                distribution[i] = int(v['count'])
+        distribution = np.log10(distribution)
+        distribution /= np.sum(distribution)
+        return distribution
+        
+    def _preprocess_entity_vocab(self, dataset: KGDataset):
+        entity_vocab = copy.deepcopy(self.RESERVED_ENT_VOCAB)
+
+        logger.info('Preprocessing entity vocabulary..')
+
+        src_ids = dataset.edge_data[dataset.config.edge_src_col].value_counts()
+        dst_ids = dataset.edge_data[dataset.config.edge_dst_col].value_counts()
+        id_counts = src_ids.add(dst_ids, fill_value=0)
+
+        def _insert_idx_counts(index, counts, prefix='', id_to_ent_id=None):
+            for id, count in tqdm(zip(index, counts), total=len(counts)):
+                id = prefix + str(id)
+                ent_id = len(entity_vocab)
+                entity_vocab[ent_id] = { 'id': id, 'count': count }
+                if id_to_ent_id is not None:
+                    id_to_ent_id[id] = ent_id
+
+        # mapping between holding and asset IDs and their respective entity ID
+        id_to_ent_id = dict()
+
+        _insert_idx_counts(id_counts.index, id_counts, id_to_ent_id=id_to_ent_id)
+
+        # extract other categorical data
+        cat_counts = None
+        for cat_col in dataset.config.edge_cat_cols:
+            counts = dataset.edge_data[cat_col].value_counts()
+            cat_counts = counts if cat_counts is None else cat_counts.add(counts, fill_value=0)
+        for cat_col in dataset.config.node_cat_cols:
+            counts = dataset.node_data[cat_col].value_counts()
+            cat_counts = counts if cat_counts is None else cat_counts.add(counts, fill_value=0)
+        
+        _insert_idx_counts(cat_counts.index, cat_counts)
+
+        id_ent_id_set = torch.tensor(list(set(id_to_ent_id.values()))).cpu()
+        non_ent_ids = set(entity_vocab.keys()) - set(id_to_ent_id.values())
+        non_id_ent_id_set = torch.tensor(list(non_ent_ids)).cpu()
+            
+        logger.info('total number of entities: %d' % (len(entity_vocab)))
+        logger.info(f'# of All IDs in dataset: {len(id_ent_id_set)}')
+        return entity_vocab, id_ent_id_set, non_id_ent_id_set
+
+    def _collate_fn(self, dataset: KGDataset, samples, df, batch, args, train):
+        edge_ids = dataset.edge_data.index[samples]
+
+        batch = [v[None, ...] if isinstance(v, np.ndarray) else [v] for v in batch]
+        input_tok,input_tok_type,input_tok_pos,input_tok_mask,input_ent,input_ent_type,input_ent_pos,input_ent_mask,core_entity_mask,entities_unique,entity_cand = batch
+
+        input_tok = torch.LongTensor(input_tok)
+        input_tok_type = torch.LongTensor(input_tok_type)
+        input_tok_pos = torch.LongTensor(input_tok_pos)
+        input_tok_mask = torch.LongTensor(input_tok_mask)
+
+        input_ent = torch.LongTensor(input_ent)
+        input_ent_type = torch.LongTensor(input_ent_type)
+        input_ent_pos = torch.LongTensor(input_ent_pos)
+        input_ent_mask = torch.LongTensor(input_ent_mask)
+        core_entity_mask = torch.BoolTensor(core_entity_mask)
+        
+        input_tok_final, input_tok_labels = self.mask_tokens(input_tok, self.tokenizer, mlm_probability=args.mlm_probability)
+        input_ent_final, input_ent_labels = self.mask_ent(self.lm_config, train, df, edge_ids, input_ent, input_ent_pos, 
+                                                          core_entity_mask, 
+                                                          mlm_probability=args.ent_mlm_probability,
+                                                          id_ent_id_set=self.id_ent_id_set,
+                                                          ent_mask_prob=args.ent_mask_prob, rand_word_prob=args.rand_word_prob,
+                                                          khop=dataset.num_neighbors is not None)
+        
+        ent_candidates = self.generate_random_candidate(args, input_ent, entities_unique, self.sample_distribution, batch_ent_cand=entity_cand)
+        ent_candidates = torch.LongTensor(ent_candidates)
+
+        # fix position embeddings
+        input_tok_pos[:, :] = torch.arange(input_tok_pos.shape[1])
+
+        return {'input_tok': input_tok_final, 'input_tok_type': input_tok_type, 'input_tok_pos': input_tok_pos, 'tok_masked_lm_labels': input_tok_labels, 
+                'input_tok_mask': input_tok_mask, 'input_ent': input_ent_final, 'input_ent_type': input_ent_type, 'input_ent_pos': input_ent_pos, 
+                'ent_masked_lm_labels': input_ent_labels, 'input_ent_mask': input_ent_mask, 'ent_candidates': ent_candidates }
+
 
 class GNNParser(Parser):
     """Data parser for GNNs."""
@@ -501,13 +544,21 @@ class GNNParser(Parser):
 
         return pyg.data.Data(x=x, edge_index=edge_index, edge_attr=edge_attr), n_id_map
 
-    def collate_fn(self, dataset: KGDataset, samples, args, train=True):
+    def collate_fn(self, dataset: KGDataset, samples: list[int], args: Munch, train=True):
         edge_df, node_df = dataset.sample_neighs(samples)
         gnn_input = self.parse_df(dataset, edge_df, node_df, train=train, args=args)
 
         (batch, pos_seed_mask, neg_seed_mask), _ = self._collate_fn(dataset, samples, edge_df, gnn_input, args, train=train)
 
         return batch, pos_seed_mask, neg_seed_mask
+
+    @property
+    def n_node_feats(self):
+        return sum(len(v) for v in self.node_onehot_dicts.values()) + len(self.dataset.config.node_cont_cols)
+
+    @property
+    def n_edge_feats(self):
+        return sum(len(v) for v in self.edge_onehot_dicts.values()) + len(self.dataset.config.edge_cont_cols)
 
     def _collate_fn(self, dataset: KGDataset, samples, df_edges, gnn_input, args, train):
         batch, n_id_map = gnn_input
@@ -592,33 +643,15 @@ class GNNParser(Parser):
         #4. return the necessary stuff
         return (batch, pos_seed_mask, neg_seed_mask), seed_edge_node_ids
 
-    @property
-    def n_node_feats(self):
-        return sum(len(v) for v in self.node_onehot_dicts.values()) + len(self.dataset.config.node_cont_cols)
-
-    @property
-    def n_edge_feats(self):
-        return sum(len(v) for v in self.edge_onehot_dicts.values()) + len(self.dataset.config.edge_cont_cols)
-
 
 class HybridLMGNNParser(Parser):
-    """Data parser for hybrid LM+GNN."""
+    """Data parser for hybrid LM+GNN architectures."""
     def __init__(self, *args, tokenizer=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
         self.lm_parser = LMParser(*args, tokenizer=tokenizer, **kwargs)
         self.gnn_parser = GNNParser(*args, **kwargs)
 
-    def _mask_gnn_edges(self, turl_input, df_gnn_edges):
-        # return df_gnn_edges
-        input_ent_pos, input_ent_labels = turl_input['input_ent_pos'], turl_input['ent_masked_lm_labels']
-        masked_ents_pos = input_ent_pos[input_ent_labels != -1].numpy()
-        # entity positions ignore the first 2 cols, so we add 2 to the position
-        cells_to_change = np.zeros(df_gnn_edges.shape, dtype=bool)
-        cells_to_change[masked_ents_pos[:, 0], 2+masked_ents_pos[:, 1]] = True
-        df_gnn_edges[cells_to_change] = np.nan
-        return df_gnn_edges
-   
     def collate_fn(self, dataset: KGDataset, samples, args, train):
         edge_df, node_df = dataset.sample_neighs(samples)
 
@@ -673,3 +706,14 @@ class HybridLMGNNParser(Parser):
         gnn_input, seed_edge_node_ids = self.gnn_parser._collate_fn(dataset, samples, df_gnn_edges, gnn_input, args, train)
 
         return turl_input, gnn_input, (seed_edge_node_ids, node_ent_ids,)
+
+    def _mask_gnn_edges(self, turl_input, df_gnn_edges):
+        # return df_gnn_edges
+        input_ent_pos, input_ent_labels = turl_input['input_ent_pos'], turl_input['ent_masked_lm_labels']
+        masked_ents_pos = input_ent_pos[input_ent_labels != -1].numpy()
+        # entity positions ignore the first 2 cols, so we add 2 to the position
+        cells_to_change = np.zeros(df_gnn_edges.shape, dtype=bool)
+        cells_to_change[masked_ents_pos[:, 0], 2+masked_ents_pos[:, 1]] = True
+        df_gnn_edges[cells_to_change] = np.nan
+        return df_gnn_edges
+   

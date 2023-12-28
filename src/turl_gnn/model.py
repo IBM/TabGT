@@ -41,12 +41,6 @@ class TURLGNN(nn.Module):
         elif config.gnn_arch == "pna":
             self.gnn = PNA(gnn_config)
 
-    def load_turl_pretrained(self, checkpoint):
-        self.turl.load_pretrained(checkpoint)
-
-    def load_gnn_pretrained(self, checkpoint):
-        self.turl.load_pretrained(checkpoint)
-
     def freeze_turl(self):
         # Freeze the weights
         for param in self.turl.parameters():

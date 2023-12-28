@@ -1,3 +1,4 @@
+"""Training and inference functions for hybrid TURL + GNN architecture."""
 import glob
 import logging
 import os
@@ -16,21 +17,29 @@ from torch.utils.data import DataLoader
 from transformers import get_inverse_sqrt_schedule, get_constant_schedule
 
 from ..utils import set_seed
-from .config import TURLGNNConfig
-from .model import TURLGNN
 from ..turl.config import TURLConfig
 from ..gnn.config import GNNConfig
 from ..data import KGDataset
 from ..parsers import HybridLMGNNParser
+from .config import TURLGNNConfig
+from .model import TURLGNN, FusedTURLGNN
 
 pd.options.mode.chained_assignment = None
 
+# Force PyTorch to allocate GPU memory more carefully
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
 
+# Setup logging
 logger = logging.getLogger(__name__)
 
 
 def accuracy(output, target, ignore_index=None):
+    """Compute accuracy for TURL header MLM objective.
+    
+    .. note::
+
+        See the original code `here <https://github.com/sunlab-osu/TURL/blob/bfec92e942a648695b3910aab42a6f0b679d37fc/model/metric.py#L5>`_.
+    """
     with torch.no_grad():
         pred = torch.argmax(output, dim=1)
         assert pred.shape[0] == len(target)
@@ -45,6 +54,12 @@ def accuracy(output, target, ignore_index=None):
 
 
 def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
+    """Rotate saved model checkpoints.
+    
+    .. note::
+
+        See the original code `here <https://github.com/sunlab-osu/TURL/blob/bfec92e942a648695b3910aab42a6f0b679d37fc/run_table_CER_finetuning.py#L69>`_.
+    """
     if not args.save_total_limit:
         return
     if args.save_total_limit <= 0:
@@ -73,14 +88,29 @@ def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
         shutil.rmtree(checkpoint)
 
 
-def calc_ent_acc(parser: HybridLMGNNParser, ent_prediction_scores, input_ent_labels, ent_candidates, id_ent_id_set, input_ent_pos):
+def calc_ent_acc(parser: HybridLMGNNParser, ent_prediction_scores, input_ent_labels, ent_candidates, id_ent_id_set, input_ent_pos) -> dict[str, float]:
+    """Calculate cell filling accuracy metrics.
+    
+    Returns
+    -------
+    dict[str, float]
+        Dictionnary with different metrics related to entity cell filling (CF).
+        The keys are:
+
+        - ``ent_acc``: Total entity CF accuracy.
+        - ``id_ent_acc``: CF accuracy on entities which are node IDs.
+        - ``nonid_ent_acc``: CF accuracy on entities which are **not** node IDs.
+        - ``edge_feat_acc``: CF accuracy on edge feature cells.
+        - ``node_feat_acc``: CF accuracy on node feature cells.
+    """
     ignore_mask = input_ent_labels != -1
 
-    ## There are much more entities which are IDs than regular entities 
+    # Node ID mask
     id_mask = torch.isin(input_ent_labels, id_ent_id_set)
     nonid_mask = ignore_mask & (~id_mask)
     id_mask = ignore_mask & id_mask
-    # Edge and node features
+
+    # Edge and node feature masks
     edge_feat_mask = ignore_mask & torch.isin(input_ent_pos[..., 1], parser.lm_parser.edge_feat_cols)
     node_feat_mask = ignore_mask & torch.isin(input_ent_pos[..., 1], parser.lm_parser.node_feat_cols)
         
@@ -97,12 +127,14 @@ def calc_ent_acc(parser: HybridLMGNNParser, ent_prediction_scores, input_ent_lab
 
     y_pred = ent_prediction_scores.argmax(dim=-1)
 
+    # Compute accuracies
     ent_acc = (y_pred[ignore_mask] == labels[ignore_mask]).float().mean().item()
     id_ent_acc = (y_pred[id_mask] == labels[id_mask]).float().mean().item()
     nonid_ent_acc = (y_pred[nonid_mask] == labels[nonid_mask]).float().mean().item()
     ent_edgefeat_acc = (y_pred[edge_feat_mask] == labels[edge_feat_mask]).float().mean().item()
     ent_nodefeat_acc = (y_pred[node_feat_mask] == labels[node_feat_mask]).float().mean().item()
 
+    # NaN -> 0.0
     if np.isnan(ent_acc): ent_acc = 0.0
     if np.isnan(id_ent_acc): id_ent_acc = 0.0
     if np.isnan(nonid_ent_acc): nonid_ent_acc = 0.0
@@ -112,7 +144,14 @@ def calc_ent_acc(parser: HybridLMGNNParser, ent_prediction_scores, input_ent_lab
     return {'ent_acc': ent_acc, 'id_ent_acc': id_ent_acc, 'nonid_ent_acc': nonid_ent_acc, 'edge_feat_acc': ent_edgefeat_acc, 'node_feat_acc': ent_nodefeat_acc}
 
 
-def compute_mrr(pos_pred, neg_pred, ks):
+def compute_mrr(pos_pred, neg_pred, ks) -> (float, dict[str, float]):
+    """Compute mean reciprocal rank (MRR) and Hits@k for link prediction.
+    
+    Returns
+    -------
+    float, dict[str, float]
+        MRR and dictionnary with Hits@k metrics. 
+    """
     pos_pred = pos_pred.detach().clone().cpu().numpy().flatten()
     neg_pred = neg_pred.detach().clone().cpu().numpy().flatten()
 
@@ -139,6 +178,7 @@ def compute_mrr(pos_pred, neg_pred, ks):
         reciprocal_rank = 1 / ranks[-1]
         mrr_scores.append(reciprocal_rank)
     
+    # Calculate Hits@k
     for key in keys:
         hits_dict[key] /= count
 
@@ -148,7 +188,8 @@ def compute_mrr(pos_pred, neg_pred, ks):
     return mrr, hits_dict
 
 
-def lp_compute_metrics(pos_pred, neg_pred, pos_labels, neg_labels):
+def lp_compute_metrics(pos_pred, neg_pred, pos_labels, neg_labels) -> dict[str, float]:
+    """Compute mean accuracy and positive F1 score for link prediction."""
     # Calculate positive accuracy
     pos_accuracy = np.mean(pos_pred == pos_labels)
     
@@ -175,7 +216,7 @@ def lp_compute_metrics(pos_pred, neg_pred, pos_labels, neg_labels):
     return { 'lp_mean_acc': mean_accuracy, 'lp_pos_f1': pos_f1 }
 
 
-def gnn_get_predictions_and_labels(pos_pred, neg_pred, pos_label, neg_label, config) -> dict[str, np.ndarray]:
+def gnn_get_predictions_and_labels(pos_pred, neg_pred, pos_label, neg_label) -> dict[str, np.ndarray]:
     pos_pred = (pos_pred >= 0.5).float()
     neg_pred = (neg_pred >= 0.5).float()
 
@@ -187,6 +228,7 @@ def gnn_get_predictions_and_labels(pos_pred, neg_pred, pos_label, neg_label, con
 
 
 def compute_auc(pos_probs, neg_probs, pos_labels, neg_labels):
+    """Compute the area under the curve (AUC) of precision/recall for link prediction."""
     probs = np.concatenate((pos_probs, neg_probs), axis=0)
     labels = np.concatenate((pos_labels, neg_labels), axis=0)
 
@@ -197,21 +239,23 @@ def compute_auc(pos_probs, neg_probs, pos_labels, neg_labels):
 
 
 def train(args, config: TURLGNNConfig, turl_config: TURLConfig, gnn_config: GNNConfig, train_dataset: KGDataset, 
-          model: TURLGNN, parser: HybridLMGNNParser, eval_dataset: Optional[KGDataset] = None, log_wandb=True, debug=False):
-    """ Train the model """
+          model: TURLGNN | FusedTURLGNN, parser: HybridLMGNNParser, eval_dataset: Optional[KGDataset] = None, log_wandb=True):
+    """Train the hybrid TURL+GNN architecture."""
     args.train_batch_size = args.per_gpu_train_batch_size
 
-    # train dataset is always shuffled
+    # Define train data loader
     train_dataset.set_khop(enable=True, num_neighbors=args.num_neighbors)
     train_loader = DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=args.shuffle_train,
                               collate_fn=lambda samples: parser.collate_fn(train_dataset, samples, args=args, train=True))
 
+    # Total number of batch training steps
     t_total = len(train_loader) * args.num_train_epochs
 
+    # How often to save model
     args.save_steps = int(len(train_loader) * args.save_epochs)
     logger.info(f"Saving model every {args.save_steps} steps")
 
-    # Prepare optimizer and schedule (linear warmup and decay)
+    # Prepare optimizer and lr scheduler
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
@@ -231,18 +275,18 @@ def train(args, config: TURLGNNConfig, turl_config: TURLConfig, gnn_config: GNNC
     logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d", args.train_batch_size)
     logger.info("  Total optimization steps = %d", t_total)
 
-    # WandB
+    # Log to WandB
     if log_wandb:
         run = wandb.init(project=f"TURL_GNN-{args.unique_n}", name=args.run_name, config=args)
+
+    set_seed(args.seed)  # Added here for reproducibility 
 
     global_step = 0
     tr_loss = 0.0
     tok_tr_loss, ent_tr_loss = 0.0, 0.0
     model.zero_grad()
-    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=True)
-    set_seed(args.seed)  # Added here for reproducibility 
     model.train()
-    for epoch_i in train_iterator:
+    for epoch_i in trange(int(args.num_train_epochs), desc="Epoch", disable=True):
         logger.info(f'****** EPOCH {epoch_i} ******')
         batch_metrics = { 'lr': [], 'loss': [],
             'tok_acc': [], 'ent_acc': [], 'id_ent_acc': [], 'nonid_ent_acc': [], 'edge_feat_acc': [], 'node_feat_acc': [], 
@@ -254,14 +298,12 @@ def train(args, config: TURLGNNConfig, turl_config: TURLConfig, gnn_config: GNNC
 
         epoch_iterator = tqdm(train_loader, desc=f"Epoch {epoch_i}", position=0, disable=False)
         for step, batch in enumerate(epoch_iterator):
-            # DELETEME
-            if debug and step > 10: break
-
-            # GENERAL
+            ## Model input
+            # General input
             seed_edge_node_ids, node_ent_ids = batch[2]            
             seed_edge_node_ids, node_ent_ids = seed_edge_node_ids.to(args.device), node_ent_ids.to(args.device)
 
-            # TURL
+            # TURL input
             turl_kwargs = batch[0]
             turl_kwargs = {k: v.to(args.device) for k, v in turl_kwargs.items()}
 
@@ -275,20 +317,20 @@ def train(args, config: TURLGNNConfig, turl_config: TURLConfig, gnn_config: GNNC
             node_feat_ent_mask = torch.isin(input_ent_pos[..., 1], parser.lm_parser.node_feat_cols.to(args.device)).detach()
             turl_kwargs.update(dict(edge_feat_ent_mask=edge_feat_ent_mask, node_feat_ent_mask=node_feat_ent_mask, id_ent_mask=id_ent_mask))
 
-            # GNN
+            # GNN input
             gnn_data, pos_seed_mask, neg_seed_mask = batch[1] 
             gnn_data.to(args.device)
             gnn_kwargs = dict(x=gnn_data.x, edge_index=gnn_data.edge_index, edge_attr=gnn_data.edge_attr, 
                               pos_edge_index=gnn_data.pos_edge_index, pos_edge_attr=gnn_data.pos_edge_attr,
                               neg_edge_index=gnn_data.neg_edge_index, neg_edge_attr=gnn_data.neg_edge_attr)
                     
-            # FORWARD PASS
+            ## Forward pass
             optimizer.zero_grad()
         
             turl_outputs, gnn_outputs = model(turl_kwargs, gnn_kwargs, seed_edge_node_ids, node_ent_ids)
             del turl_kwargs, gnn_kwargs
 
-            # TURL OUTPUTS
+            # TURL outputs
             tok_outputs, ent_outputs = turl_outputs
             tok_loss = tok_outputs[0]  # model outputs are always tuple in transformers (see doc)
             id_ent_loss, edge_ent_loss, node_ent_loss = ent_outputs[0]
@@ -296,22 +338,23 @@ def train(args, config: TURLGNNConfig, turl_config: TURLConfig, gnn_config: GNNC
             tok_prediction_scores = tok_outputs[1]
             ent_prediction_scores = ent_outputs[1]
 
-            # GNN OUTPUTS
+            # GNN outputs
             pos_labels = gnn_data.pos_y
             pos_pred = gnn_outputs[0]
             neg_labels = gnn_data.neg_y
             neg_pred = gnn_outputs[1]
             gnn_loss = model.gnn_loss_fn(pos_pred, neg_pred)
             
-            # Compute loss
+            ## Compute loss
             ent_loss = (id_ent_loss + edge_ent_loss * args.edge_feat_w + node_ent_loss * args.node_feat_w) / (1 + args.edge_feat_w + args.node_feat_w)
             turl_loss = tok_loss * args.loss_lambda + ent_loss * (1 - args.loss_lambda)
 
-            # We support alternating the objective 
+            # Optionally alternate the objective to backprop
             cf_w, lp_w = {"cf": (1, 0), "lp": (0, 1), "cf+lp": (1, 1)}[config.alternate_objective[alternating_objective_i]]
             alternating_objective_i = (alternating_objective_i + 1) % len(config.alternate_objective)
             loss = turl_loss * cf_w + gnn_loss * config.lp_loss_w * lp_w
 
+            # Validate loss
             if torch.isnan(loss) or torch.isinf(loss):
                 logger.warning(f'{step}, {global_step} - Loss is {loss} (!). \n{turl_loss=} \n{gnn_loss=} \n{tok_loss=} \n{ent_loss=} \n{id_ent_loss=} \n{edge_ent_loss=} \n{node_ent_loss=}')
 
@@ -321,7 +364,7 @@ def train(args, config: TURLGNNConfig, turl_config: TURLConfig, gnn_config: GNNC
             tok_prediction_scores, input_tok_labels = tok_prediction_scores.detach().cpu(), input_tok_labels.detach().cpu()
             tok_loss, ent_loss = tok_loss.detach().cpu(), ent_loss.detach().cpu()
 
-            # Compute gradient
+            ## Compute gradients
             loss.backward()
 
             loss = loss.detach().cpu()
@@ -330,59 +373,62 @@ def train(args, config: TURLGNNConfig, turl_config: TURLConfig, gnn_config: GNNC
             tok_tr_loss += tok_loss.detach().item()
             ent_tr_loss += ent_loss.detach().item()
             
+            ## Compute train metrics
             batch_metrics['loss'].append(loss.detach().item())
 
-            # TURL PREDICTIONS
-            # save predictions for later per-epoch accuracy
+            # TURL predictions and metrics (cell filling and header MLM)
             turl_metrics = calc_ent_acc(parser, ent_prediction_scores, input_ent_labels, ent_candidates, parser.lm_parser.id_ent_id_set, input_ent_pos)
             tok_acc = accuracy(tok_prediction_scores.view(-1, turl_config.vocab_size), input_tok_labels.view(-1), ignore_index=-1).item()
             for k, v in turl_metrics.items():
                 batch_metrics[k].append(v)
             batch_metrics['tok_acc'].append(tok_acc)
 
-            # GNN PREDICTIONS
+            # GNN predictions and metrics (link prediction)
             gnn_mrr, gnn_hits_dict = compute_mrr(pos_pred, neg_pred, [1,2,5,10])
             gnn_auc = compute_auc(pos_pred, neg_pred, pos_labels, neg_labels)
             for key in gnn_hits_dict:
                 batch_metrics['lp_'+key].append(gnn_hits_dict[key])
             batch_metrics['lp_mrr'].append(gnn_mrr)
             batch_metrics['lp_auc'].append(gnn_auc)
-            gnn_preds_labels = gnn_get_predictions_and_labels(pos_pred, neg_pred, pos_labels, neg_labels, gnn_config)
+            gnn_preds_labels = gnn_get_predictions_and_labels(pos_pred, neg_pred, pos_labels, neg_labels)
             lp_metrics = lp_compute_metrics(**gnn_preds_labels)
             for key in lp_metrics:
                 batch_metrics[key].append(lp_metrics[key])
             for k, v in gnn_preds_labels.items(): 
                 epoch_preds_labels[k].extend(v.tolist())
 
-            ## LOG
+            # Log batch metrics
             if (step + 1) % args.log_lr_every == 0:
                 # Get the current learning rate from the scheduler
-                learning_rate = scheduler.get_last_lr()[0]  # Assuming there is only one learning rate
+                learning_rate = scheduler.get_last_lr()[0]  
                 batch_metrics['lr'].append(learning_rate)
                 logger.info(f'\nTrain ' + '| '.join([f'{k}: {v[-1]:.4g}' for k,v in batch_metrics.items()]))
 
                 if log_wandb:
                     wandb.log({f'batch_{k}': v[-1] for k, v in batch_metrics.items()}, step=global_step)
                 
+            ## Update model parameters
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
             scheduler.step()  # Update learning rate schedule
 
             global_step += 1
 
+            ## Save model checkpoint
             if args.save_steps > 0 and global_step % args.save_steps == 0:
-                # Save model checkpoint
                 output_dir = os.path.join(args.output_dir, '{}-{}'.format('checkpoint', global_step))
                 os.makedirs(output_dir, exist_ok=True)
                 model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
 
+                # Save model and optimizer states
                 torch.save({ 'model_state_dict': model_to_save.state_dict(), 'optimizer_state_dict': optimizer.state_dict() }, os.path.join(output_dir, 'state.tar'))
                 torch.save(args, os.path.join(output_dir, 'training_args.bin'))
                 logger.info("Saving model checkpoint to %s" % output_dir)
 
                 _rotate_checkpoints(args, 'checkpoint')
 
-        # After epoch ends:
+        ## After epoch ends
+        # Log epoch metrics
         epoch_metrics = {f'tr_{met}': np.mean(batch_metrics[met]) for met in ['loss', 'tok_acc', 'ent_acc', 'id_ent_acc', 'nonid_ent_acc', 'edge_feat_acc', 'node_feat_acc', 'lp_mean_acc', 'lp_auc', 'lp_mrr', 'lp_hits@1', 'lp_hits@2', 'lp_hits@5', 'lp_hits@10']}
         epoch_preds_labels = {k: np.array(v) for k, v in epoch_preds_labels.items()}
         lp_metrics = lp_compute_metrics(**gnn_preds_labels)
@@ -392,22 +438,25 @@ def train(args, config: TURLGNNConfig, turl_config: TURLConfig, gnn_config: GNNC
         for k, v in epoch_metrics.items():
             logger.info(f" {k}: {v:.4g}")
 
-        if log_wandb:
+        if log_wandb: 
             wandb.log(epoch_metrics, step=global_step)
         
-        # Log validation metrics
-        # clear CUDA cache before evaluating
+        # Do evaluation
+        # Clear CUDA cache before evaluating
         torch.cuda.empty_cache()
-        results = evaluate(args, parser, config, turl_config, gnn_config, eval_dataset, model, prefix=f'EPOCH {epoch_i}', debug=debug)
+        results = evaluate(args, parser, config, turl_config, eval_dataset, model, prefix=f'EPOCH {epoch_i}')
         model.train()
 
-        if log_wandb: wandb.log(results, step=global_step)
+        # Log eval metrics
+        if log_wandb: 
+            wandb.log(results, step=global_step)
 
 
-def evaluate(args, parser: HybridLMGNNParser, config: TURLGNNConfig, turl_config: TURLConfig, gnn_config: GNNConfig, eval_dataset: KGDataset, model, prefix="", debug=False):
-    # Loop to handle MNLI double evaluation (matched, mis-matched)
+def evaluate(args, parser: HybridLMGNNParser, config: TURLGNNConfig, turl_config: TURLConfig, eval_dataset: KGDataset, model: TURLGNN | FusedTURLGNN, prefix=""):
+    """Evaluate hybrid TURL+GNN architecture."""
     args.eval_batch_size = args.per_gpu_eval_batch_size
-    # Note that DistributedSampler samples randomly
+
+    # Define eval data loader
     eval_dataset.set_khop(enable=True, num_neighbors=args.num_neighbors)
     eval_loader = DataLoader(eval_dataset, batch_size=args.eval_batch_size, shuffle=False,
                               collate_fn=lambda samples: parser.collate_fn(eval_dataset, samples, args=args, train=False))
@@ -422,17 +471,15 @@ def evaluate(args, parser: HybridLMGNNParser, config: TURLGNNConfig, turl_config
     model.eval()
     with torch.no_grad():
         step=0
-
         for batch in tqdm(eval_loader, desc=f"Evaluating", position=0, leave=False):
-            # DELETEME
             step+=1
-            if debug and step>10: break
 
-            # GENERAL
+            ## Model inputs
+            # General input
             seed_edge_node_ids, node_ent_ids = batch[2]            
             seed_edge_node_ids, node_ent_ids = seed_edge_node_ids.to(args.device), node_ent_ids.to(args.device)
 
-            # TURL
+            # TURL input
             turl_kwargs = batch[0]
             turl_kwargs = {k: v.to(args.device) for k, v in turl_kwargs.items()}
 
@@ -446,14 +493,14 @@ def evaluate(args, parser: HybridLMGNNParser, config: TURLGNNConfig, turl_config
             node_feat_ent_mask = torch.isin(input_ent_pos[..., 1], parser.lm_parser.node_feat_cols.to(args.device)).detach()
             turl_kwargs.update(dict(edge_feat_ent_mask=edge_feat_ent_mask, node_feat_ent_mask=node_feat_ent_mask, id_ent_mask=id_ent_mask))
 
-            # GNN
+            # GNN input
             gnn_data, pos_seed_mask, neg_seed_mask = batch[1] 
             gnn_data.to(args.device)
             gnn_kwargs = dict(x=gnn_data.x, edge_index=gnn_data.edge_index, edge_attr=gnn_data.edge_attr, 
                             pos_edge_index=gnn_data.pos_edge_index, pos_edge_attr=gnn_data.pos_edge_attr,
                             neg_edge_index=gnn_data.neg_edge_index, neg_edge_attr=gnn_data.neg_edge_attr)
                     
-            # FORWARD PASS
+            ## Forward pass
             model.train()
             turl_outputs, gnn_outputs = model(turl_kwargs, gnn_kwargs, seed_edge_node_ids, node_ent_ids)
             del turl_kwargs, gnn_kwargs
@@ -469,7 +516,7 @@ def evaluate(args, parser: HybridLMGNNParser, config: TURLGNNConfig, turl_config
             ent_loss = id_ent_loss + edge_ent_loss * args.edge_feat_w + node_ent_loss * args.node_feat_w
             turl_loss = tok_loss * args.loss_lambda + ent_loss * (1 - args.loss_lambda)
 
-            # GNN OUTPUTS
+            # GNN outputs
             pos_labels = gnn_data.pos_y
             pos_pred = gnn_outputs[0]
             neg_labels = gnn_data.neg_y
@@ -481,37 +528,38 @@ def evaluate(args, parser: HybridLMGNNParser, config: TURLGNNConfig, turl_config
             pos_pred, neg_pred, pos_labels, neg_labels = pos_pred.detach().cpu(), neg_pred.detach().cpu(), pos_labels.detach().cpu(), neg_labels.detach().cpu()
             tok_prediction_scores, input_tok_labels = tok_prediction_scores.detach().cpu(), input_tok_labels.detach().cpu()
 
-            # COMPUTE LOSS
+            ## Compute loss
             loss = turl_loss + gnn_loss * config.lp_loss_w
 
+            ## Compute batch metrics
             batch_metrics['loss'].append(loss.mean().item())
 
-            # TURL PREDICTIONS
-            # save predictions for later per-epoch accuracy
+            # TURL predictions and metrics (cell filling and header MLM)
             turl_metrics = calc_ent_acc(parser, ent_prediction_scores, input_ent_labels, ent_candidates, parser.lm_parser.id_ent_id_set, input_ent_pos)
             tok_acc = accuracy(tok_prediction_scores.view(-1, turl_config.vocab_size), input_tok_labels.view(-1), ignore_index=-1).item()
             for k, v in turl_metrics.items():
                 batch_metrics[k].append(v)
             batch_metrics['tok_acc'].append(tok_acc)
 
-            # GNN PREDICTIONS
+            # GNN predictions and metrics (link prediction)
             gnn_mrr, gnn_hits_dict = compute_mrr(pos_pred, neg_pred, [1,2,5,10])
             gnn_auc = compute_auc(pos_pred, neg_pred, pos_labels, neg_labels)
             for key in gnn_hits_dict:
                 batch_metrics['lp_'+key].append(gnn_hits_dict[key])
             batch_metrics['lp_mrr'].append(gnn_mrr)
             batch_metrics['lp_auc'].append(gnn_auc)
-            gnn_preds_labels = gnn_get_predictions_and_labels(pos_pred, neg_pred, pos_labels, neg_labels, gnn_config)
+            gnn_preds_labels = gnn_get_predictions_and_labels(pos_pred, neg_pred, pos_labels, neg_labels)
             lp_metrics = lp_compute_metrics(**gnn_preds_labels)
             for key in lp_metrics:
                 batch_metrics[key].append(lp_metrics[key])
             for k, v in gnn_preds_labels.items(): 
                 eval_preds_labels[k].extend(v.tolist())
 
+            # Log batch metrics
             if step % args.eval_log_metrics_every == 0:
                 logger.info(f'\nEval ' + '| '.join([f'{k}: {v[-1]:.4g}' for k,v in batch_metrics.items()]))
 
-
+    ## Compute eval metrics
     eval_metrics = {f'ev_{met}': np.mean(batch_metrics[met]) for met in ['loss', 'tok_acc', 'ent_acc', 'id_ent_acc', 'nonid_ent_acc', 'edge_feat_acc', 'node_feat_acc', 'lp_mean_acc', 'lp_auc', 'lp_mrr', 'lp_hits@1', 'lp_hits@2', 'lp_hits@5', 'lp_hits@10']}
     eval_preds_labels = {k: np.array(v) for k, v in eval_preds_labels.items()}
     lp_metrics = lp_compute_metrics(**gnn_preds_labels)
