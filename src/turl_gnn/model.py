@@ -1,9 +1,10 @@
+"""Hybrid TURL + GNN architectures."""
 import logging
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch_geometric.nn import GINEConv, BatchNorm, LayerNorm
+from torch_geometric.nn import GINEConv, BatchNorm
 
 from .config import TURLGNNConfig
 from ..turl.config import TURLConfig
@@ -16,6 +17,36 @@ logger = logging.getLogger(__name__)
 
 
 class TURLGNN(nn.Module):
+    """Parallel ``TURL | GNN`` architecture.
+
+    This architecture includes TURL and a GNN in parallel sharing the input node 
+    ID embeddings. Therefore, the cell filling and link prediction objectives
+    from both architectures update the global node embeddings during training::
+
+        ┌──────────────────────────┐
+        │  Global Node Embeddings  │
+        └────────────┬─────────────┘
+                     │
+            ┌────────┴─────────┐
+            │                  │
+            │                  │
+        ┌───▼──┐            ┌──▼──┐
+        │ TURL │            │ GNN │
+        └───┬──┘            └──┬──┘
+            │                  │
+            ▼                  ▼
+         Cell               Link
+         filling            prediction
+    
+    Parameters
+    ----------
+    config : TURLGNNConfig
+        Hybrid configuration
+    turl_config : TURLConfig
+        TURL configuration
+    gnn_config : GNNConfig
+        GNN configuration
+    """
     def __init__(self, config: TURLGNNConfig, turl_config: TURLConfig, gnn_config: GNNConfig):
         super(TURLGNN, self).__init__()
 
@@ -91,6 +122,10 @@ class TURLGNN(nn.Module):
 
 
 class GNNLayer(nn.Module):
+    """Generic GNN layer for fused architecture.
+    
+    Currently, only GIN aggregation is supported.
+    """
     def __init__(self, gnn_config: GNNConfig):
         super(GNNLayer, self).__init__()
         
@@ -104,7 +139,23 @@ class GNNLayer(nn.Module):
     def forward(self, x, edge_index, edge_attr):
         return self.batch_norm(self.agg(x, edge_index, edge_attr))
 
+
 class FusedTURLGNN(nn.Module):
+    """Fused ``TURL<->GNN`` architecture.
+    
+    Parameters
+    ----------
+    config : TURLGNNConfig
+        Hybrid configuration
+    turl_config : TURLConfig
+        TURL configuration
+    gnn_config : GNNConfig
+        GNN configuration
+    pooling_function : str
+        If using multiple "lm" or "gnn" layers in parallel, their embeddings are
+        pooled according to this function. Currently, only "mean" pooling is 
+        supported.
+    """
     def __init__(self, 
                  config: TURLGNNConfig, 
                  turl_config: TURLConfig,
